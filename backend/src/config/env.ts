@@ -31,7 +31,7 @@ export const env = {
     apiVersion: process.env.WHATSAPP_API_VERSION ?? "v25.0",
     token: getEnv("WHATSAPP_TOKEN"),
     phoneNumberId: getEnv("WHATSAPP_PHONE_NUMBER_ID", process.env.PHONE_NUMBER_ID),
-    verifyToken: getEnv("WHATSAPP_VERIFY_TOKEN", "whatsapp-verify-token"),
+    verifyToken: getEnv("WHATSAPP_VERIFY_TOKEN", "my_super_secret_verify_token_2026"),
   },
   payment: {
     baseUrl: getEnv("EASYPAISA_PAYMENT_BASE_URL", "https://easypaisa.example.com/pay"),
