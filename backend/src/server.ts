@@ -19,19 +19,19 @@
 
 import { createApp } from "./app.js";
 import { connectToDatabase } from "./config/database.js";
+import { env } from "./config/env.js";
 
-let app: ReturnType<typeof createApp>;
+const bootstrap = async () => {
+  await connectToDatabase();
 
-const initialize = async () => {
-  if (!app) {
-    await connectToDatabase();
-    app = createApp();
-  }
+  const app = createApp();
 
-  return app;
+  app.listen(env.app.port, () => {
+    console.log(`Server running on port ${env.app.port}`);
+  });
 };
 
-export default async (req: any, res: any) => {
-  const app = await initialize();
-  return app(req, res);
-};
+bootstrap().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
