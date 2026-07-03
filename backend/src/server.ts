@@ -1,18 +1,37 @@
+// import { createApp } from "./app.js";
+// import { connectToDatabase } from "./config/database.js";
+// import { env } from "./config/env.js";
+
+// const bootstrap = async (): Promise<void> => {
+//   await connectToDatabase();
+
+//   const app = createApp();
+
+//   app.listen(env.app.port, () => {
+//     console.log(`Server running on port ${env.app.port}`);
+//   });
+// };
+
+// bootstrap().catch((error) => {
+//   console.error("Failed to start application.", error);
+//   process.exit(1);
+// });
+
 import { createApp } from "./app.js";
 import { connectToDatabase } from "./config/database.js";
-import { env } from "./config/env.js";
 
-const bootstrap = async (): Promise<void> => {
-  await connectToDatabase();
+let app: ReturnType<typeof createApp>;
 
-  const app = createApp();
+const initialize = async () => {
+  if (!app) {
+    await connectToDatabase();
+    app = createApp();
+  }
 
-  app.listen(env.app.port, () => {
-    console.log(`Server running on port ${env.app.port}`);
-  });
+  return app;
 };
 
-bootstrap().catch((error) => {
-  console.error("Failed to start application.", error);
-  process.exit(1);
-});
+export default async (req: any, res: any) => {
+  const app = await initialize();
+  return app(req, res);
+};
