@@ -1,0 +1,1098 @@
+# WhatsApp Commerce App — Full Flow Documentation
+
+## Overview
+
+A full-stack WhatsApp Commerce order management system. Customers place orders via WhatsApp, receive Easypaisa payment links, and get automated status updates. Admins manage orders, products, and payments through a React dashboard.
+
+**Stack:** TypeScript, Express.js, MongoDB (Mongoose), React (Vite), WhatsApp Cloud API, Easypaisa Payment Gateway.
+**Deployment:** Vercel (serverless) or standalone Node.js server.
+
+---
+
+## Directory Structure
+
+```
+whatsapp-node/
+├── read.memd                          ← This file
+├── README.md
+├── backend/                           ← Express API server
+│   ├── api/index.ts                   ← Vercel serverless entry point
+│   ├── src/
+│   │   ├── server.ts                  ← Standalone server entry point
+│   │   ├── app.ts                     ← Express app factory
+│   │   ├── container.ts               ← DI container (wires all services & controllers)
+│   │   ├── config/
+│   │   │   ├── env.ts                 ← Environment variable loader
+│   │   │   └── database.ts            ← MongoDB connection (mongoose.connect wrapper)
+│   │   ├── controllers/
+│   │   │   ├── admin-auth.controller.ts  ← Login/logout/me HTTP handlers
+│   │   │   ├── admin.controller.ts       ← Admin CRUD: orders, payments, products
+│   │   │   ├── health.controller.ts      ← Health check endpoint
+│   │   │   ├── order.controller.ts       ← Manual order creation (POST /api/orders)
+│   │   │   └── webhook.controller.ts     ← WhatsApp + Payment webhook handlers
+│   │   ├── middleware/
+│   │   │   └── admin-auth.middleware.ts  ← Cookie OR API key auth guard
+│   │   ├── models/
+│   │   │   ├── order.model.ts         ← Order schema + model
+│   │   │   ├── payment.model.ts       ← Payment schema + model
+│   │   │   └── product.model.ts       ← Product schema + model
+│   │   ├── routes/
+│   │   │   └── index.ts               ← All 15 route definitions in one file
+│   │   ├── services/
+│   │   │   ├── admin-auth.service.ts  ← HMAC session tokens, cookies, API key validation
+│   │   │   ├── admin.service.ts       ← Admin queries: list/filter orders, list payments
+│   │   │   ├── order.service.ts       ← ★ Core business logic (webhooks, orders, payments)
+│   │   │   ├── payment.service.ts     ← Easypaisa payment link generation (HMAC signed)
+│   │   │   ├── product.service.ts     ← Product CRUD + catalog ID uniqueness
+│   │   │   └── whatsapp.service.ts    ← WhatsApp Cloud API — send text messages
+│   │   └── types/
+│   │       └── order.ts               ← Shared types: OrderStatus, PaymentStatus
+│   ├── .env.example
+│   ├── package.json
+│   ├── tsconfig.json
+│   └── vercel.json
+└── frontend/                          ← React admin panel
+    ├── index.html
+    ├── src/
+    │   ├── main.tsx                   ← React entry: BrowserRouter > AuthProvider > AppRoutes
+    │   ├── styles.css                 ← Design tokens (CSS variables) + component styles
+    │   ├── types.ts                   ← Frontend types (mirrors backend OrderStatus, etc.)
+    │   ├── auth/
+    │   │   ├── AuthProvider.tsx        ← Auth context: login/logout state, session check on mount
+    │   │   ├── Login.tsx              ← Login form (pre-filled "admin", password toggle, error display)
+    │   │   ├── Register.tsx           ← Static setup instructions page (not a signup form)
+    │   │   └── ProtectedRoute.tsx     ← Route guard: checks isAuthenticated, redirects to /login
+    │   ├── components/
+    │   │   ├── AdminNav.tsx           ← Sidebar with NavLinks (Overview/Orders/Products/Payments) + Sign Out
+    │   │   ├── EmptyRow.tsx           ← Empty table placeholder row (colSpan + message)
+    │   │   ├── MetricCard.tsx         ← Dashboard stat card (label, value, optional green/amber tone)
+    │   │   └── StatusBadge.tsx        ← Colored pill badge (replaces underscores with spaces)
+    │   ├── pages/admin/
+    │   │   ├── AdminLayout.tsx        ← Shell: CSS grid sidebar 258px + workspace + topbar with Refresh
+    │   │   ├── OverviewPage.tsx       ← Dashboard: 6 metric cards (parallel fetch on mount)
+    │   │   ├── OrdersPage.tsx         ← Order table + filters (search text, status dropdown) + status update
+    │   │   ├── ProductsPage.tsx       ← Two-column: editor form (left) + product table (right)
+    │   │   └── PaymentsPage.tsx       ← Payment table (order ref, gateway ref, amount, status, date)
+    │   ├── routes/
+    │   │   └── AppRoutes.tsx          ← Routes: /login, /register, /admin/* (protected)
+    │   ├── services/api/
+    │   │   ├── axiosInstance.ts       ← Axios: baseURL=/api, withCredentials=true
+    │   │   ├── authService.ts         ← API: login(), logout(), me()
+    │   │   └── adminService.ts        ← API: getOrders, getPayments, getProducts, updateOrderStatus, saveProduct
+    │   └── utils/
+    │       └── formatters.ts          ← money() PKR formatter, formatDate() locale formatter
+    ├── vite.config.ts                 ← Vite + React plugin, dev proxy /api → localhost:5000
+    ├── package.json
+    └── tsconfig.json
+```
+
+---
+
+## Dependency Injection Wiring (container.ts)
+
+The `ApplicationContainer` class is the wiring hub. It instantiates all services and controllers:
+
+```
+ApplicationContainer
+  ├── adminAuthService          (no deps)
+  ├── adminService              (no deps)
+  ├── paymentGatewayService     (no deps)
+  ├── productService            (no deps)
+  ├── whatsAppService           (no deps — accepts optional Axios instance for testability)
+  ├── orderService              (depends on: paymentGatewayService, whatsAppService)
+  ├── adminAuthController       (depends on: adminAuthService)
+  ├── adminController           (depends on: adminService, productService)
+  ├── healthController          (no deps)
+  ├── orderController           (depends on: orderService)
+  └── webhookController         (depends on: orderService)
+```
+
+The container is passed to `createRouter()` which wires each route to its controller method.
+
+---
+
+## API Routes (All prefixed with `/api`)
+
+| Method | Path | Auth | Controller Method | Purpose |
+|--------|------|------|-------------------|---------|
+| GET | `/health` | No | `healthController.getHealth` | Health check |
+| POST | `/orders` | No | `orderController.createOrder` | Manual order creation (returns 201) |
+| GET | `/webhooks/whatsapp` | No | `webhookController.verifyWhatsAppWebhook` | WhatsApp webhook verification challenge |
+| POST | `/webhooks/whatsapp` | No | `webhookController.handleWhatsAppWebhook` | Incoming WhatsApp messages (returns 200, errors → 500) |
+| POST | `/webhooks/payment` | No | `webhookController.handlePaymentWebhook` | Payment gateway callbacks (returns 200, errors → 400) |
+| POST | `/admin/auth/login` | No | `adminAuthController.login` | Admin login (returns Set-Cookie header, 401 on bad creds) |
+| POST | `/admin/auth/logout` | No | `adminAuthController.logout` | Admin logout (clears cookie via Max-Age=0) |
+| GET | `/admin/auth/me` | Cookie or API Key | `adminAuthController.me` | Verify session is still valid (returns 200 or 401 via middleware) |
+| GET | `/admin/orders` | Cookie or API Key | `adminController.listOrders` | List orders (query: `status`, `paymentStatus`, `search`) |
+| GET | `/admin/orders/:orderReference` | Cookie or API Key | `adminController.getOrder` | Get single order (404 if missing) |
+| PATCH | `/admin/orders/:orderReference/status` | Cookie or API Key | `adminController.updateOrderStatus` | Update order status (body: `status`, `note?`) |
+| GET | `/admin/payments` | Cookie or API Key | `adminController.listPayments` | List payments (query: `status`) |
+| GET | `/admin/products` | Cookie or API Key | `adminController.listProducts` | List all products |
+| POST | `/admin/products` | Cookie or API Key | `adminController.createProduct` | Create product (409 if duplicate catalogProductId) |
+| PATCH | `/admin/products/:productId` | Cookie or API Key | `adminController.updateProduct` | Update product (404 if missing, 409 if duplicate) |
+
+---
+
+## MongoDB Models
+
+### Order (`orders` collection)
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `orderReference` | String | Required, unique, indexed. Format: `ORD-{Date.now()}-{0-999}` |
+| `customerName` | String | Default: `"WhatsApp Customer"` |
+| `whatsappNumber` | String | Required, indexed |
+| `sourceMessageId` | String | Optional, from WhatsApp message `id` field |
+| `productName` | String | Default: `"Catalog Product"` |
+| `catalogProductId` | String | Optional, links to WhatsApp catalog |
+| `quantity` | Number | Min 1, default 1 |
+| `totalAmount` | Number | Required, min 0 |
+| `currency` | String | Required, default `"PKR"` |
+| `status` | Enum | `pending_payment` → `payment_received` → `confirmed` → `processing` → `failed` |
+| `paymentStatus` | Enum | `pending`, `paid`, `failed` |
+| `paymentLink` | String | Generated Easypaisa payment URL (set after order creation) |
+| `paymentGatewayReference` | String | Indexed, set when payment webhook arrives |
+| `history` | Array of `{ status, note, changedAt }` | Embedded sub-documents (no `_id` on sub-docs) |
+| `createdAt` / `updatedAt` | Date | Auto timestamps |
+
+### Payment (`payments` collection)
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `orderReference` | String | Required, indexed |
+| `gatewayReference` | String | Indexed, from payment gateway |
+| `amount` | Number | Required, min 0. Falls back to order's `totalAmount`, then `rawPayload.amount`, then 0 |
+| `currency` | String | Required, default `"PKR"` |
+| `status` | Enum | `pending`, `paid`, `failed` (indexed) |
+| `rawPayload` | Mixed | Full webhook payload from payment gateway (stored as-is) |
+| `createdAt` / `updatedAt` | Date | Auto timestamps |
+
+### Product (`products` collection)
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `name` | String | Required, trimmed |
+| `description` | String | Default `""` |
+| `catalogProductId` | String | Unique (sparse), indexed. Sparse allows multiple `null` values |
+| `price` | Number | Required, min 0 |
+| `currency` | String | Required, default `"PKR"` |
+| `stockQuantity` | Number | Required, min 0, default 0 |
+| `isActive` | Boolean | Required, default `false`, indexed |
+| `createdAt` / `updatedAt` | Date | Auto timestamps |
+
+---
+
+## Shared Types (backend/src/types/order.ts)
+
+```typescript
+OrderStatus   = "pending_payment" | "payment_received" | "confirmed" | "processing" | "failed"
+PaymentStatus = "pending" | "paid" | "failed"
+OrderHistoryEntry = { status: string; note: string; changedAt: Date }
+```
+
+---
+
+## Core Flows
+
+### Flow 1: App Startup
+
+```
+STANDALONE MODE (server.ts):
+  server.ts
+    → config/database.ts: mongoose.connect(MONGODB_URI)  ← connects once, persists
+    → app.ts: createApp()
+        → new ApplicationContainer()                     ← wires all services & controllers
+        → new Express app
+        → express.json() middleware
+        → createRouter(container)                        ← mounts all 15 routes at /api
+        → express.static("../frontend/dist") at /admin   ← serves React SPA in production
+    → app.listen(port)
+
+VERCEL SERVERLESS MODE (api/index.ts):
+  api/index.ts exports handler function
+    → On first cold start: mongoose.connect() + createApp() → caches app instance
+    → On subsequent warm requests: reuses cached app (no reconnect)
+    → vercel.json routes all requests (/(.*)) to this single handler
+```
+
+### Flow 2: WhatsApp Order → Payment Link → Payment → Confirmation
+
+This is the **PRIMARY** business flow of the entire app.
+
+```
+STEP 1: Customer sends a message on WhatsApp
+─────────────────────────────────────────────
+  Customer types an order message or taps an interactive button in WhatsApp
+      ↓
+  WhatsApp Cloud API forwards the message to your webhook URL
+
+
+STEP 2: Your webhook receives and processes the message
+─────────────────────────────────────────────
+
+  POST /api/webhooks/whatsapp
+      ↓
+  ┌─ WebhookController.handleWhatsAppWebhook(req, res) ──────────────────┐
+  │  Wraps in try/catch: returns 200 on success, 500 on error            │
+  └──────────────────────────────────────────────────────────────────────┘
+      ↓
+  OrderService.handleWhatsAppWebhook(body)
+      │
+      ├── extractMessageChanges(body)
+      │     Traverses: body.entry[]?.changes[]?.value
+      │     Uses flatMap + filter to extract all WhatsAppMessageValue objects
+      │     Handles missing/undefined safely with optional chaining
+      │
+      └── For each message value: processMessageValue(value)
+            │
+            ├── 1. Guard: if (!firstMessage?.from) return early (no sender)
+            │
+            ├── 2. Extract customer info:
+            │       customerName   = contacts[0]?.profile?.name ?? "WhatsApp Customer"
+            │       whatsappNumber = messages[0].from                          ← required
+            │       sourceMessageId = messages[0].id
+            │
+            ├── 3. Extract product info (falls through multiple sources):
+            │       productName = button_reply?.title                     ← interactive button
+            │                   ?? text?.body                             ← plain text message
+            │                   ?? "Catalog Product"                      ← fallback default
+            │       catalogProductId = order?.product_items[0]?.product_retailer_id
+            │                        ?? order?.catalog_id
+            │       quantity = order?.product_items[0]?.quantity ?? 1
+            │       totalAmount = DEFAULT_AMOUNT × quantity               ← from env
+            │
+            ├── 4. createOrder(input)
+            │       → OrderModel.create({
+            │           orderReference: "ORD-{Date.now()}-{Math.random()×1000}",
+            │           customerName, whatsappNumber, sourceMessageId,
+            │           productName, catalogProductId, quantity, totalAmount,
+            │           currency: env.payment.defaultCurrency,
+            │           status: "pending_payment",
+            │           paymentStatus: "pending",
+            │           history: [{
+            │             status: "pending_payment",
+            │             note: "Order created from WhatsApp webhook.",
+            │             changedAt: new Date()
+            │           }]
+            │         })
+            │
+            ├── 5. attachPaymentLink(order)
+            │       → PaymentGatewayService.createPaymentLink({ orderRef, amount, currency })
+            │         (see "Payment Gateway Integration" section below)
+            │       → OrderModel.findOneAndUpdate(
+            │           { orderReference },
+            │           { paymentLink: url },
+            │           { new: true }
+            │         )
+            │       → Returns updated order (or original if update failed)
+            │
+            └── 6. WhatsAppService.sendTextMessage(to, body)
+                  → POST https://graph.facebook.com/{apiVersion}/{phoneNumberId}/messages
+                  → Headers: Authorization: Bearer {WHATSAPP_TOKEN}
+                  → Body: {
+                      messaging_product: "whatsapp",
+                      to: whatsappNumber,
+                      type: "text",
+                      text: {
+                        body: "Thank you {name}. Your order {ref} has been created. Payment link: {url}"
+                      }
+                    }
+                  → Message sent as single joined string (3 parts separated by space)
+
+
+STEP 3: Customer pays via Easypaisa
+─────────────────────────────────────────────
+  Customer clicks the payment link → completes payment on Easypaisa's page
+      ↓
+  Easypaisa sends a callback POST to your webhook
+
+
+STEP 4: Your payment webhook processes the callback
+─────────────────────────────────────────────
+
+  POST /api/webhooks/payment
+      ↓
+  ┌─ WebhookController.handlePaymentWebhook(req, res) ─────────────────┐
+  │  Wraps in try/catch: returns 200 on success, 400 on error         │
+  └────────────────────────────────────────────────────────────────────┘
+      ↓
+  OrderService.handlePaymentWebhook(body)
+      │
+      ├── 1. Extract fields (tries multiple possible field names):
+      │       orderReference = body.orderReference
+      │                     ?? body.orderRef
+      │                     ?? body.merchantOrderId
+      │                     ?? ""              ← stringified
+      │       gatewayRef     = body.transactionId
+      │                     ?? body.txnRefNo
+      │                     ?? body.paymentId
+      │                     ?? ""              ← stringified
+      │       paymentStatus  = (body.paymentStatus ?? body.status ?? "").toLowerCase()
+      │
+      ├── 2. Guard: if (!orderReference) → throw Error (caught by controller → 400)
+      │
+      ├── 3. IF paymentStatus IS NOT "paid" AND IS NOT "success":
+      │     ┌─ FAILED PAYMENT PATH ───────────────────────────────────────┐
+      │     │                                                             │
+      │     │  a. recordPayment({ status: "failed", ... })                │
+      │     │       → Looks up Order to get amount & currency             │
+      │     │       → PaymentModel.create({                               │
+      │     │           orderReference, gatewayReference,                 │
+      │     │           amount: order?.totalAmount                        │
+      │     │                   ?? rawPayload.amount ?? 0,                │
+      │     │           currency: order?.currency ?? defaultCurrency,     │
+      │     │           status: "failed",                                 │
+      │     │           rawPayload: body                                  │
+      │     │         })                                                  │
+      │     │                                                             │
+      │     │  b. updateOrderStatus(orderRef, "failed", "failed",         │
+      │     │        "Payment failed or was not completed.",              │
+      │     │        gatewayRef)                                          │
+      │     │       → OrderModel.findOneAndUpdate(                        │
+      │     │           { orderReference },                               │
+      │     │           {                                                 │
+      │     │             status: "failed",                               │
+      │     │             paymentStatus: "failed",                        │
+      │     │             paymentGatewayReference: gatewayRef,            │
+      │     │             $push: { history: { status, note, changedAt } } │
+      │     │           },                                                │
+      │     │           { new: true }                                     │
+      │     │         )                                                   │
+      │     │                                                             │
+      │     │  Returns the updated order. NO WhatsApp message sent.       │
+      │     └─────────────────────────────────────────────────────────────┘
+      │
+      └── 4. IF paymentStatus IS "paid" OR "success":
+            ┌─ SUCCESSFUL PAYMENT PATH ───────────────────────────────────┐
+            │                                                             │
+            │  a. recordPayment({ status: "paid", ... })                  │
+            │       → PaymentModel.create({ ...same fields, status: "paid" })
+            │                                                             │
+            │  b. updateOrderStatus(orderRef, "payment_received", "paid", │
+            │        "Payment received from gateway webhook.", gatewayRef)│
+            │                                                             │
+            │  c. If order found:                                         │
+            │       WhatsAppService.sendTextMessage(                      │
+            │         whatsappNumber,                                     │
+            │         "Payment received for order {ref}."                 │
+            │       )                                                     │
+            │                                                             │
+            │  d. updateOrderStatus(orderRef, "confirmed", "paid",        │
+            │        "Order confirmed automatically after payment.")      │
+            │                                                             │
+            │  e. If order found:                                         │
+            │       WhatsAppService.sendTextMessage(                      │
+            │         whatsappNumber,                                     │
+            │         "Order confirmed. We are preparing {productName}    │
+            │          for delivery or processing."                       │
+            │       )                                                     │
+            │                                                             │
+            │  f. updateOrderStatus(orderRef, "processing", "paid",       │
+            │        "Order moved to processing.")                        │
+            │                                                             │
+            │  g. If order found:                                         │
+            │       WhatsAppService.sendTextMessage(                      │
+            │         whatsappNumber,                                     │
+            │         "Delivery or processing update: your order {ref}    │
+            │          is now in progress."                               │
+            │       )                                                     │
+            │                                                             │
+            │  Returns the "confirmed" order.                             │
+            │  ★ Each status transition is sequential (awaited).          │
+            │  ★ Each WhatsApp send is gated: only sends if the           │
+            │    previous status update found the order.                  │
+            │  ★ This means 3 separate WhatsApp messages after payment.  │
+            └─────────────────────────────────────────────────────────────┘
+```
+
+### Flow 3: Order Status Lifecycle
+
+```
+                         Customer sends WhatsApp message
+                                   │
+                                   ▼
+                         ┌──────────────────┐
+                         │  pending_payment  │  ← Order created, payment link generated & sent
+                         └────────┬─────────┘
+                                  │
+                         Payment webhook received
+                                  │
+                   ┌──────────────┼──────────────┐
+                   │ failed/other                 │ "paid" or "success"
+                   ▼                              ▼
+             ┌──────────┐              ┌──────────────────┐
+             │  failed   │              │ payment_received  │  ← WhatsApp: "Payment received for order {ref}"
+             └──────────┘              └────────┬─────────┘
+              (no message sent)                 │
+                                                ▼
+                                      ┌──────────────────┐
+                                      │    confirmed      │  ← WhatsApp: "Order confirmed. Preparing {product}..."
+                                      └────────┬─────────┘
+                                                │
+                                                ▼
+                                      ┌──────────────────┐
+                                      │   processing      │  ← WhatsApp: "Order {ref} is now in progress."
+                                      └──────────────────┘
+
+  What happens at each state change:
+    → Order.status field updated
+    → Order.paymentStatus field updated (on payment webhook transitions)
+    → Order.paymentGatewayReference set (on payment webhook transitions)
+    → Order.history[] gets a new { status, note, changedAt } entry via $push
+    → WhatsApp notification sent to customer (except on "failed")
+    → Each status update uses findOneAndUpdate with { new: true }
+```
+
+### Flow 4: Manual Order Creation (API)
+
+```
+  External system / API client / Postman
+      │
+      ▼
+  POST /api/orders
+  Body: {
+    customerName: string,        ← required
+    whatsappNumber: string,      ← required
+    productName: string,         ← required
+    catalogProductId?: string,
+    quantity?: number,           ← defaults to 1
+    totalAmount?: number         ← defaults to env.payment.defaultAmount
+  }
+      │
+      ▼
+  OrderController.createOrder(req, res)
+    → Calls OrderService.createFromManualInput(req.body)
+      → Returns 201 { success: true, data: order }
+      │
+      ▼
+  OrderService.createFromManualInput(input)
+      │
+      ├── quantity    = input.quantity ?? 1
+      ├── totalAmount = input.totalAmount ?? env.payment.defaultAmount
+      ├── orderReference = buildOrderReference()  → "ORD-{Date.now()}-{random 0-999}"
+      │
+      ├── createOrder({ ...input, orderReference, quantity, totalAmount,
+      │                 currency: env.payment.defaultCurrency })
+      │     → OrderModel.create({ status: "pending_payment", paymentStatus: "pending",
+      │                          history: [{ status: "pending_payment",
+      │                                      note: "Order created from WhatsApp webhook.",
+      │                                      changedAt: new Date() }] })
+      │
+      └── attachPaymentLink(order)
+            → PaymentGatewayService.createPaymentLink(...)
+            → OrderModel.findOneAndUpdate({ orderReference }, { paymentLink }, { new: true })
+            → Returns updated order
+
+  ★ NOTE: Manual order creation does NOT send a WhatsApp message.
+    Only orders from WhatsApp webhooks get the payment link sent via WhatsApp.
+```
+
+### Flow 5: Admin Authentication
+
+```
+═══ LOGIN ═══
+
+  Browser → POST /api/admin/auth/login
+  Body: { username, password }
+      │
+      ▼
+  AdminAuthController.login(req, res)
+      │
+      ├── AdminAuthService.validateCredentials(username, password)
+      │     → Guard: if (!env.app.adminPassword) return false
+      │                (prevents login when password is not configured)
+      │     → crypto.timingSafeEqual(username, env.app.adminUsername)
+      │     → crypto.timingSafeEqual(password, env.app.adminPassword)
+      │     → All comparisons use constant-time to prevent timing attacks
+      │
+      ├── (if invalid) → 401 { success: false, message: "Invalid credentials" }
+      │
+      └── (if valid):
+            │
+            ├── AdminAuthService.createSessionToken(username)
+            │     → payload = { username, expiresAt: Date.now() + 28800000 }  ← 8 hours
+            │     → encoded  = Buffer.from(JSON.stringify(payload)).toString("base64url")
+            │     → signature = HMAC-SHA256(ADMIN_SESSION_SECRET, encoded)
+            │                    .digest("base64url")
+            │     → returns "{encoded}.{signature}"
+            │
+            ├── AdminAuthService.createCookie(token)
+            │     → Set-Cookie string:
+            │         admin_session={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=28800
+            │         + "; Secure" if NODE_ENV === "production"
+            │
+            └── Response: 200 { success: true, data: { username } }
+                + res.setHeader("Set-Cookie", cookie)
+
+
+═══ SESSION CHECK (every protected request) ═══
+
+  Browser → GET /api/admin/orders (or any admin route)
+  Cookie: admin_session={token}
+      │
+      ▼
+  requireAdminAuth middleware runs FIRST:
+      │
+      ├── 1. Try cookie auth:
+      │       sessionToken = AdminAuthService.extractCookie(req.header("cookie"))
+      │         → Parses "Cookie" header string
+      │         → Splits by ";", trims each
+      │         → Finds cookie starting with "admin_session="
+      │         → Extracts value after "admin_session="
+      │       AdminAuthService.verifySessionToken(sessionToken)
+      │         → Splits at ".": [encodedPayload, signature]
+      │         → Guard: if either part missing or signatures don't match → false
+      │         → Recomputes HMAC-SHA256(secret, encodedPayload).digest("base64url")
+      │         → crypto.timingSafeEqual(computed, provided)
+      │         → Decodes payload: JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"))
+      │         → Verifies: payload.username === env.app.adminUsername
+      │         → Verifies: payload.expiresAt > Date.now()
+      │         → Returns true/false
+      │
+      ├── 2. Try API key auth (fallback):
+      │       apiKey = req.header("x-admin-api-key")
+      │       AdminAuthService.validateApiKey(apiKey)
+      │         → Guard: env.app.adminApiKey must be set AND apiKey must be truthy
+      │         → crypto.timingSafeEqual(apiKey, env.app.adminApiKey)
+      │
+      ├── If EITHER method passes → next()  (proceed to controller)
+      │
+      └── If BOTH fail → 401 { success: false, error: "Admin authentication required." }
+
+  After middleware passes, the controller runs:
+      ▼
+  AdminAuthController.me(req, res)
+    → Response: 200 { success: true }
+
+
+═══ LOGOUT ═══
+
+  Browser → POST /api/admin/auth/logout
+      │
+      ▼
+  AdminAuthController.logout(req, res)
+      → AdminAuthService.clearCookie()
+          → Set-Cookie: admin_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0
+          → ★ NOTE: clearCookie does NOT include Secure flag (unlike createCookie)
+      → Response: 200 { success: true }
+
+
+═══ API KEY AUTH (server-to-server) ═══
+
+  External service → Any admin route
+  Header: x-admin-api-key: {key}
+      │
+      ▼
+  requireAdminAuth middleware:
+    → AdminAuthService.validateApiKey(apiKey)
+        → Requires BOTH env.app.adminApiKey to be configured AND apiKey header present
+        → crypto.timingSafeEqual() comparison
+    → If valid, bypasses cookie check entirely
+```
+
+### Flow 6: Admin Panel Operations (with exact DB queries)
+
+```
+  ┌─ FRONTEND ──────────────────────────────────────────────────────────┐
+  │  React App (Vite dev: localhost:5173)                               │
+  │  Vite proxy: /api → http://localhost:5000                           │
+  │  Axios: baseURL="/api", withCredentials=true (sends cookies)        │
+  └─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+  ┌─ BACKEND ───────────────────────────────────────────────────────────┐
+  │  requireAdminAuth middleware (cookie or API key)                     │
+  │  Controller → Service → Mongoose Model → MongoDB                    │
+  └─────────────────────────────────────────────────────────────────────┘
+
+
+  ═══ DASHBOARD (OverviewPage) ═══
+
+    Mount → 3 parallel GET requests:
+      GET /api/admin/orders     → AdminService.listOrders()
+      GET /api/admin/products   → ProductService.listProducts()
+      GET /api/admin/payments   → AdminService.listPayments()
+
+    Displays 6 metric cards:
+      ├── Total orders        → orders.length
+      ├── Paid orders (green) → orders.filter(o => o.paymentStatus === "paid").length
+      ├── Pending (amber)     → orders.filter(o => o.paymentStatus === "pending").length
+      ├── Published products  → products.filter(p => p.isActive).length
+      ├── Payments count      → payments.length
+      └── Paid amount (green) → sum of payments.filter(p => p.status === "paid").amount
+
+
+  ═══ ORDER MANAGEMENT (OrdersPage) ═══
+
+    GET /api/admin/orders?status=X&paymentStatus=Y&search=Z
+      → AdminService.listOrders({ status, paymentStatus, search })
+        Builds MongoDB query:
+          query.status = filters.status           ← exact match if provided
+          query.paymentStatus = filters.paymentStatus  ← exact match if provided
+          query.$or = [                           ← case-insensitive regex OR search
+            { orderReference: /search/i },
+            { customerName: /search/i },
+            { whatsappNumber: /search/i }
+          ]                                        ← only if search is provided
+        → OrderModel.find(query).sort({ createdAt: -1 }).exec()
+
+    PATCH /api/admin/orders/:orderReference/status
+      Body: { status: "confirmed"|"processing"|..., note?: string }
+      → AdminService.updateOrderStatus(orderRef, status, note)
+        Default note: "Order updated from admin panel."
+        → OrderModel.findOneAndUpdate(
+            { orderReference },
+            {
+              status,
+              $push: {
+                history: { status, note, changedAt: new Date() }
+              }
+            },
+            { new: true }
+          ).exec()
+        → Returns updated order or null → controller returns 404 if null
+
+    ★ NOTE: Admin status updates only change `status`, NOT `paymentStatus`.
+      The payment webhook is the only path that changes paymentStatus.
+
+
+  ═══ PRODUCT MANAGEMENT (ProductsPage) ═══
+
+    GET /api/admin/products
+      → ProductService.listProducts()
+        → ProductModel.find().sort({ createdAt: -1 }).exec()
+
+    POST /api/admin/products
+      Body: { name, catalogProductId?, price, stockQuantity, description?, isActive }
+      → ProductService.createProduct(input)
+        → ensureUniqueCatalogProductId(input.catalogProductId)
+            → If catalogProductId provided:
+                ProductModel.findOne({ catalogProductId }).select("_id").exec()
+                If found → throw DuplicateProductCatalogIdError → 409
+        → ProductModel.create({
+            ...input,
+            currency: input.currency ?? env.payment.defaultCurrency,
+            stockQuantity: input.stockQuantity ?? 0,
+            isActive: input.isActive ?? false
+          })
+        → Returns 201
+
+    PATCH /api/admin/products/:productId
+      Body: { name?, catalogProductId?, price?, stockQuantity?, description?, isActive? }
+      → ProductService.updateProduct(productId, input)
+        → ensureUniqueCatalogProductId(input.catalogProductId, productId)
+            → Excludes current product from uniqueness check
+        → ProductModel.findByIdAndUpdate(productId, input, {
+            new: true,
+            runValidators: true
+          }).exec()
+        → If null → 404
+        → If DuplicateProductCatalogIdError → 409
+        → Otherwise → 200
+
+
+  ═══ PAYMENT LISTING (PaymentsPage) ═══
+
+    GET /api/admin/payments?status=paid
+      → AdminService.listPayments(status?)
+        → PaymentModel.find(status ? { status } : {}).sort({ createdAt: -1 }).exec()
+```
+
+### Flow 7: Frontend Routing & Auth Guard
+
+```
+  User visits app in browser
+      │
+      ▼
+  main.tsx renders:
+    <BrowserRouter>
+      <AuthProvider>              ← context provider, holds isAuthenticated + isCheckingAuth
+        <AppRoutes />
+      </AuthProvider>
+    </BrowserRouter>
+      │
+      ▼
+  AuthProvider mounts (useEffect):
+    → Calls authService.me() → GET /api/admin/auth/me
+    → If 200: set isAuthenticated = true
+    → If error (401/network): set isAuthenticated = false
+    → Either way: set isCheckingAuth = false
+      │
+      ▼
+  AppRoutes renders:
+      │
+      ├── /login         → <Login />                   (public — no guard)
+      ├── /register      → <Register />                (public — setup instructions, not a signup)
+      │
+      └── /admin/*       → <ProtectedRoute>            (layout route — auth guard)
+            │                 │
+            │                 ├── isCheckingAuth = true  → Show "Checking admin session..." spinner
+            │                 ├── isAuthenticated = false → <Navigate to="/login" />
+            │                 └── isAuthenticated = true  → <AdminLayout> <Outlet /> </AdminLayout>
+            │
+            └── Nested routes inside <AdminLayout>:
+                  ├── index  (/)          → <OverviewPage />   Dashboard
+                  ├── /orders             → <OrdersPage />     Order table + filters
+                  ├── /products           → <ProductsPage />   Product editor + table
+                  └── /payments           → <PaymentsPage />   Payment table
+            │
+            └── Catch-all (*) → <Navigate to="/admin" />
+
+  AdminLayout shell renders:
+    ┌──────────────────────────────────────────────────────────────┐
+    │  SIDEBAR (258px)        │  WORKSPACE                         │
+    │                          │  ┌──────────────────────────────┐ │
+    │  "WhatsApp Commerce"     │  │  TOPBAR                      │ │
+    │  "Admin Panel"           │  │  Page Title (from pathname)  │ │
+    │  ──────────────────      │  │  [Refresh] button (reloads)  │ │
+    │  📊 Overview  (NavLink)  │  └──────────────────────────────┘ │
+    │  📦 Orders    (NavLink)  │                                    │
+    │  🏷️ Products  (NavLink)  │  <Outlet />  (page content)       │
+    │  💰 Payments  (NavLink)  │                                    │
+    │  ──────────────────      │                                    │
+    │  Sign Out (calls logout) │                                    │
+    └──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## WhatsApp Message Extraction — Deep Dive
+
+The `processMessageValue()` method in OrderService handles parsing WhatsApp webhook payloads:
+
+```
+INCOMING PAYLOAD STRUCTURE (from WhatsApp Cloud API):
+
+  body.entry[]                              ← array of entry objects
+    .changes[]                              ← array of change objects
+      .value                                ← WhatsAppMessageValue (the actual message data)
+        .contacts[]                         ← sender info
+          .profile.name                     ← display name
+          .wa_id                            ← WhatsApp ID (phone number)
+        .messages[]                         ← message objects
+          .id                               ← message ID
+          .from                             ← sender phone number
+          .type                             ← "text" | "interactive" | "order" | ...
+          .text.body                        ← message text (for type="text")
+          .interactive.button_reply         ← for type="interactive"
+            .id                             ← button ID
+            .title                          ← button display title
+          .order                            ← for type="order"
+            .catalog_id                     ← WhatsApp catalog ID
+            .product_items[]               ← ordered items
+              .product_retailer_id          ← catalog product ID
+              .quantity                     ← item quantity
+
+PRODUCT NAME EXTRACTION (fallback chain):
+  1. message.interactive?.button_reply?.title    ← interactive button press
+  2. message.text?.body                          ← plain text message content
+  3. "Catalog Product"                           ← hardcoded fallback
+
+TOTAL AMOUNT CALCULATION:
+  totalAmount = env.payment.defaultAmount × quantity
+  (There is no per-product pricing in the WhatsApp flow — it uses a flat default × quantity)
+```
+
+---
+
+## Payment Gateway Integration (Easypaisa)
+
+```
+  ═══ PAYMENT LINK GENERATION ═══
+
+  PaymentGatewayService.createPaymentLink({ orderReference, amount, currency })
+      │
+      ├── 1. Build query string via URLSearchParams:
+      │       storeId     = env.payment.storeId
+      │       orderRef    = orderReference
+      │       amount      = amount.toFixed(2)            ← formatted to 2 decimal places
+      │       currency    = currency
+      │       callbackUrl = env.payment.callbackUrl
+      │
+      ├── 2. Sign the query string:
+      │       signature = HMAC-SHA256(env.payment.hashKey, query.toString())
+      │                     .digest("hex")
+      │
+      ├── 3. Append signature to query:
+      │       query.set("signature", signature)
+      │
+      └── 4. Return full URL:
+            return "{env.payment.baseUrl}?{query.toString()}"
+
+  Example final URL:
+    https://easypaisa.com/payment?storeId=123&orderRef=ORD-1234-567&amount=1000.00&
+    currency=PKR&callbackUrl=https://mysite.com/api/webhooks/payment&
+    signature=abc123def456...
+
+
+  ═══ PAYMENT CALLBACK PARSING ═══
+
+  When Easypaisa POSTs to /api/webhooks/payment, handlePaymentWebhook()
+  tries multiple field names for maximum compatibility:
+
+    orderReference:  body.orderReference ?? body.orderRef ?? body.merchantOrderId ?? ""
+    gatewayRef:      body.transactionId  ?? body.txnRefNo   ?? body.paymentId       ?? ""
+    paymentStatus:   (body.paymentStatus ?? body.status ?? "").toLowerCase()
+
+  Only "paid" and "success" are treated as successful payments.
+  Everything else (including empty, "failed", "pending", "cancelled", etc.) → failed path.
+```
+
+---
+
+## WhatsApp Cloud API Integration
+
+```
+  ═══ WEBHOOK VERIFICATION (one-time setup) ═══
+
+  When configuring the webhook in Meta Business Manager:
+    WhatsApp → GET /api/webhooks/whatsapp?hub.mode=subscribe&hub.verify_token={YOUR_TOKEN}&hub.challenge={CODE}
+
+    WebhookController.verifyWhatsAppWebhook:
+      → Extracts: req.query["hub.mode"], ["hub.verify_token"], ["hub.challenge"]
+      → IF mode === "subscribe" AND token === env.whatsapp.verifyToken
+        → res.status(200).send(String(challenge ?? ""))    ← returns challenge as plain text
+      → ELSE
+        → res.status(403).json({ success: false, error: "Webhook verification failed." })
+
+
+  ═══ OUTBOUND MESSAGES ═══
+
+  WhatsAppService.sendTextMessage(to, body)
+    → Uses Axios instance (configurable via constructor for testing)
+    → POST https://graph.facebook.com/{apiVersion}/{phoneNumberId}/messages
+    → Headers:
+        Authorization: Bearer {WHATSAPP_TOKEN}
+        Content-Type: application/json
+    → Body: {
+        messaging_product: "whatsapp",
+        to: "923001234567",                    ← customer's WhatsApp number
+        type: "text",
+        text: {
+          body: "Thank you John. Your order ORD-1234-567 has been created. Payment link: https://..."
+        }
+      }
+
+  ★ The WhatsAppService constructor accepts an optional AxiosInstance for dependency injection.
+    In production, it creates its own Axios instance with the configured baseURL and auth header.
+```
+
+---
+
+## Error Handling Patterns
+
+```
+  ═══ WEBHOOK CONTROLLER ═══
+
+  handleWhatsAppWebhook:
+    → try/catch wraps entire handler
+    → On success: 200 { success: true }
+    → On error:   500 { success: false, error: error.message || "Unable to process WhatsApp webhook." }
+
+  handlePaymentWebhook:
+    → try/catch wraps entire handler
+    → On success: 200 { success: true, data: order }
+    → On error:   400 { success: false, error: error.message || "Unable to process payment webhook." }
+    → ★ Note: payment errors return 400 (client error), WhatsApp errors return 500 (server error)
+
+  ★ Neither webhook handler reads the response body after calling the service.
+    If the service throws, the controller catches and returns the error JSON.
+    WhatsApp always gets a 200 if processing succeeds (even if there were no messages to process).
+
+
+  ═══ ADMIN CONTROLLER ═══
+
+  Product create/update:
+    → Catches DuplicateProductCatalogIdError → 409 { success: false, error: "A product with ..." }
+    → Other errors → 400 { success: false, error: error.message || "Unable to save product." }
+
+  Order get/update:
+    → If findOneAndUpdate returns null → 404 { success: false, error: "Order not found." }
+
+  Admin auth login:
+    → Invalid credentials → 401 { success: false, error: "Invalid credentials." }
+
+
+  ═══ MIDDLEWARE ═══
+
+  requireAdminAuth:
+    → Cookie auth fails AND API key auth fails → 401 { success: false, error: "Admin authentication required." }
+
+
+  ═══ ADMIN-AUTH SERVICE ═══
+
+  validateCredentials:
+    → Guard: if env.app.adminPassword is falsy (not configured) → return false immediately
+    → This prevents login when ADMIN_PASSWORD is not set
+
+
+  ═══ ORDER SERVICE ═══
+
+  handlePaymentWebhook:
+    → If no orderReference can be extracted from the webhook body → throws Error → controller returns 400
+    → If updateOrderStatus returns null (order not found), the subsequent transition is skipped
+    → WhatsApp messages are only sent if the preceding status update succeeded (null check on each step)
+
+  processMessageValue:
+    → If the message has no "from" field → returns early (no error, silently skips)
+```
+
+---
+
+## Admin Auth Token Format
+
+```
+  Token = "{base64url(payload)}.{base64url(signature)}"
+
+  Payload (JSON):
+    {
+      "username": "admin",
+      "expiresAt": 1712345678000      ← Date.now() + (60 × 60 × 8 × 1000) = 8 hours
+    }
+
+  Creation:
+    payload_json = JSON.stringify({ username, expiresAt })
+    payload_b64  = Buffer.from(payload_json).toString("base64url")
+    signature    = crypto.createHmac("sha256", ADMIN_SESSION_SECRET)
+                         .update(payload_b64)
+                         .digest("base64url")        ← NOTE: base64url, NOT hex
+    token        = "${payload_b64}.${signature}"
+
+  Verification steps:
+    1. Split token at "."  →  [encodedPayload, signature]
+    2. Guard: both parts must exist and be non-empty
+    3. Recompute: HMAC-SHA256(secret, encodedPayload).digest("base64url")
+    4. timingSafeEqual(computed, provided)  ← constant-time comparison
+    5. Decode: JSON.parse(Buffer.from(encodedPayload, "base64url").toString("utf8"))
+    6. Verify: payload.username === env.app.adminUsername
+    7. Verify: payload.expiresAt > Date.now()
+    8. All checks must pass for the token to be valid
+
+  Cookie attributes:
+    Name:     admin_session
+    Flags:    HttpOnly; SameSite=Lax; Path=/; Max-Age=28800
+              + Secure (only if NODE_ENV === "production")
+
+  Clear cookie (logout):
+    admin_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0
+    ★ NOTE: clearCookie does NOT add Secure, even in production.
+```
+
+---
+
+## Environment Variables
+
+```
+# App
+PORT=5000
+ADMIN_API_KEY=               ← For server-to-server API auth (x-admin-api-key header)
+ADMIN_USERNAME=admin          ← Hardcoded admin username
+ADMIN_PASSWORD=               ← Hardcoded admin password (empty = no login possible)
+ADMIN_SESSION_SECRET=         ← HMAC signing secret for session cookies (required for token creation)
+
+# Database
+MONGODB_URI=mongodb+srv://... ← Required. App will fail to start without it.
+
+# WhatsApp Cloud API
+WHATSAPP_API_VERSION=v25.0    ← Facebook Graph API version
+WHATSAPP_TOKEN=               ← Permanent access token from Meta Business account
+WHATSAPP_PHONE_NUMBER_ID=     ← Phone number ID from Meta Business account
+WHATSAPP_VERIFY_TOKEN=        ← Arbitrary string you choose; used once for webhook verification
+
+# Easypaisa Payment Gateway
+EASYPAISA_PAYMENT_BASE_URL=   ← Base URL for payment page
+EASYPAISA_STORE_ID=           ← Merchant/store identifier
+EASYPAISA_HASH_KEY=           ← Secret key for HMAC signing of payment links
+EASYPAISA_CALLBACK_URL=       ← Your public URL for payment callbacks (e.g., https://yoursite.com/api/webhooks/payment)
+
+# Defaults
+DEFAULT_AMOUNT=1000           ← Default order amount in PKR (used when quantity-based pricing applies)
+DEFAULT_CURRENCY=PKR          ← Default currency code
+```
+
+---
+
+## Complete File Reference
+
+### Backend
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `api/index.ts` | ~20 | Vercel serverless handler — lazy-inits Express + MongoDB, caches app across warm starts |
+| `src/server.ts` | ~8 | Standalone server entry — `connectToDatabase()` then `app.listen(PORT)` |
+| `src/app.ts` | ~25 | Express app factory — `createApp()`: DI container, json middleware, routes at `/api`, static files at `/admin` |
+| `src/container.ts` | ~35 | DI container — `ApplicationContainer` class: instantiates all 6 services + 5 controllers, wires dependencies |
+| `src/config/env.ts` | ~40 | Loads `.env` via dotenv, exports typed `env` object with 4 sections: `app`, `database`, `whatsapp`, `payment` |
+| `src/config/database.ts` | ~5 | `connectToDatabase()` — calls `mongoose.connect(env.database.uri)` |
+| `src/models/order.model.ts` | ~80 | Order Mongoose schema + model. Fields: orderReference, customerName, whatsappNumber, sourceMessageId, productName, catalogProductId, quantity, totalAmount, currency, status (enum), paymentStatus (enum), paymentLink, paymentGatewayReference, history (embedded sub-schema, no _id). Exports: `Order`, `OrderDocument`, `OrderModel` |
+| `src/models/payment.model.ts` | ~50 | Payment Mongoose schema + model. Fields: orderReference, gatewayReference, amount, currency, status (enum), rawPayload (Mixed). Exports: `Payment`, `PaymentDocument`, `PaymentModel` |
+| `src/models/product.model.ts` | ~55 | Product Mongoose schema + model. Fields: name, description, catalogProductId (unique sparse), price, currency, stockQuantity, isActive. Exports: `Product`, `ProductDocument`, `ProductModel` |
+| `src/types/order.ts` | ~15 | Shared TypeScript types: `OrderStatus` union, `PaymentStatus` union, `OrderHistoryEntry` interface |
+| `src/services/admin-auth.service.ts` | ~91 | `AdminAuthService` — `validateCredentials`, `createSessionToken`, `verifySessionToken`, `createCookie`, `clearCookie`, `extractCookie`, `validateApiKey`, private `sign()` and `safeEqual()` helpers. All comparisons use `crypto.timingSafeEqual`. Session lifetime: 8 hours |
+| `src/services/admin.service.ts` | ~62 | `AdminService` — `listOrders(filters)` with status/paymentStatus exact match + search regex $or on orderReference/customerName/whatsappNumber, `getOrder(ref)`, `updateOrderStatus(ref, status, note)` with $push history, `listPayments(status?)` |
+| `src/services/order.service.ts` | ~302 | **Core business logic.** `OrderService` — `createFromManualInput`, `handleWhatsAppWebhook`, `handlePaymentWebhook`, private `processMessageValue` (message parsing with fallback chain), `attachPaymentLink`, `createOrder`, `updatePaymentLink`, `updateOrderStatus` (central status update + history $push), `recordPayment` (amount falls back to order → payload → 0), `extractMessageChanges` (flatMap traversal), `buildOrderReference` |
+| `src/services/payment.service.ts` | ~29 | `PaymentGatewayService` — `createPaymentLink(payload)`: builds URLSearchParams, HMAC-SHA256 signs with hex digest, appends signature to query |
+| `src/services/product.service.ts` | ~60 | `ProductService` — `listProducts`, `createProduct` (with uniqueness check), `updateProduct` (with uniqueness check excluding self), private `ensureUniqueCatalogProductId`. Custom `DuplicateProductCatalogIdError` class |
+| `src/services/whatsapp.service.ts` | ~29 | `WhatsAppService` — accepts optional AxiosInstance for DI. `sendTextMessage(to, body)`: POST to Facebook Graph API |
+| `src/controllers/admin-auth.controller.ts` | ~40 | `AdminAuthController` — `login` (validates→creates token→sets cookie), `logout` (clears cookie), `me` (returns 200 if middleware passed) |
+| `src/controllers/admin.controller.ts` | ~112 | `AdminController` — `listOrders`, `getOrder` (404 if null), `updateOrderStatus` (404 if null), `listPayments`, `listProducts`, `createProduct`, `updateProduct`. Helper methods: `getQueryString` (safe string extraction), `getRouteParam` (handles string|string[]), `handleProductError` (409 for duplicate, 400 otherwise) |
+| `src/controllers/health.controller.ts` | ~10 | `HealthController` — `getHealth`: returns `{ success: true, message: "WhatsApp commerce API is running." }` |
+| `src/controllers/order.controller.ts` | ~15 | `OrderController` — `createOrder`: calls `OrderService.createFromManualInput(req.body)`, returns 201 |
+| `src/controllers/webhook.controller.ts` | ~54 | `WebhookController` — `verifyWhatsAppWebhook` (subscribe+token check→returns challenge or 403), `handleWhatsAppWebhook` (try/catch→200 or 500), `handlePaymentWebhook` (try/catch→200 or 400) |
+| `src/middleware/admin-auth.middleware.ts` | ~19 | `requireAdminAuth` factory — takes AdminAuthService, returns middleware that checks cookie session OR x-admin-api-key header |
+| `src/routes/index.ts` | ~80 | `createRouter(dependencies)` — single file with all 15 route definitions. Wires each path to its controller method + auth middleware |
+
+### Frontend
+
+| File | Purpose |
+|------|---------|
+| `index.html` | SPA entry HTML. Title: "WhatsApp Commerce Admin". Loads `/src/main.tsx` as module |
+| `src/main.tsx` | React entry point — `<BrowserRouter> <AuthProvider> <AppRoutes />` |
+| `src/styles.css` | Custom design system: CSS variables (`--bg`, `--panel`, `--ink`, `--muted`, `--line`, `--teal`, `--amber`, `--red`, `--green`), global base styles for inputs/buttons/tables/labels, `.app-shell` grid layout, `.sidebar`/`.workspace`/`.topbar` layout classes, login panel styles, metrics grid, product editor, table styles, status badges. Responsive: single-column below 920px |
+| `src/types.ts` | Frontend types mirroring backend: `OrderStatus`, `PaymentStatus`, `Order`, `Product`, `Payment`, `ProductFormState` |
+| `src/auth/AuthProvider.tsx` | React context — `AuthProvider` component + `useAuth()` hook. State: `isAuthenticated`, `isCheckingAuth`. On mount: calls `authService.me()`. Exposes: `login()`, `logout()`, `isAuthenticated`, `isCheckingAuth` |
+| `src/auth/Login.tsx` | Login form — pre-filled "admin" username, password input with show/hide toggle, error message display, redirects to `/admin` on success |
+| `src/auth/Register.tsx` | Static page — shows instructions for setting `ADMIN_USERNAME`, `ADMIN_PASSWORD`, `ADMIN_SESSION_SECRET` in `.env`. Not a signup form |
+| `src/auth/ProtectedRoute.tsx` | Route guard — shows "Checking admin session..." while loading, redirects to `/login` if not authenticated, renders `<Outlet />` if authenticated |
+| `src/components/AdminNav.tsx` | Sidebar — brand area ("WhatsApp Commerce" / "Admin Panel"), NavLinks with lucide-react icons (Overview/Orders/Products/Payments), Sign Out button |
+| `src/components/MetricCard.tsx` | Dashboard card — `label`, `value`, optional `tone` ("green" | "amber") for left border color |
+| `src/components/StatusBadge.tsx` | Pill badge — displays `status` with underscores→spaces, CSS class driven by status value for coloring |
+| `src/components/EmptyRow.tsx` | Table empty state — single `<tr>` with `colSpan` and centered message |
+| `src/pages/admin/AdminLayout.tsx` | Shell layout — CSS grid (258px sidebar + 1fr workspace). Topbar: page title derived from `location.pathname` + Refresh button (`window.location.reload`). Renders child route via `<Outlet />` |
+| `src/pages/admin/OverviewPage.tsx` | Dashboard — `useEffect` fetches orders + products + payments in parallel (`Promise.all`). Computes 6 metrics client-side. Loading/error states handled |
+| `src/pages/admin/OrdersPage.tsx` | Orders table — fetches on mount, client-side text filter (searches ref/customer/phone/product) and status dropdown filter. Table columns: Order Ref, Customer, Product, Amount, Status badge, Update dropdown. Each row has a `<select>` to change status |
+| `src/pages/admin/ProductsPage.tsx` | Products CRUD — two-column layout: editor form (name, catalogProductId, price, stock, description, isActive checkbox) + product table. Form handles both create and update. Table shows: name, catalog ID, price, stock, Edit button, Publish/Draft toggle |
+| `src/pages/admin/PaymentsPage.tsx` | Payments table — fetches on mount. Columns: Order Reference, Gateway Reference, Amount, Status badge, Date |
+| `src/routes/AppRoutes.tsx` | Route definitions — `/login`, `/register` (public), `/admin/*` wrapped in `<ProtectedRoute>`, nested index/orders/products/payments routes, catch-all redirect to `/admin` |
+| `src/services/api/axiosInstance.ts` | Axios instance — `baseURL: "/api"`, `withCredentials: true`, `headers: { "Content-Type": "application/json" }` |
+| `src/services/api/authService.ts` | Auth API — `login(username, password)` POST, `logout()` POST, `me()` GET |
+| `src/services/api/adminService.ts` | Admin API — `getOrders()` GET, `getPayments()` GET, `getProducts()` GET, `updateOrderStatus(ref, status)` PATCH, `saveProduct(form)` POST or PATCH (determined by `form.id`) |
+| `src/utils/formatters.ts` | `money(amount, currency)` — `Intl.NumberFormat("en-PK")` PKR no decimals. `formatDate(value)` — `toLocaleString()` or "-" if falsy |
+
+---
+
+## Key Design Decisions
+
+1. **Cookie + API Key dual auth** — Browsers use `admin_session` HTTP-only cookie; server-to-server uses `x-admin-api-key` header. Both checked by the same middleware function. Either passing grants access.
+
+2. **HMAC-signed sessions (not JWT)** — Custom token format: `base64url(payload).base64url(hmac-sha256)`. Simpler than JWT libraries, same security properties. Uses Node's built-in `crypto` module.
+
+3. **Three sequential WhatsApp notifications on payment** — After payment, the customer gets three messages in sequence (each awaited): payment received → confirmed → processing. Each subsequent message only sends if the previous status update succeeded.
+
+4. **Catalog product ID uniqueness via sparse index** — Products can optionally link to WhatsApp catalog items via `catalogProductId`. The Mongoose `unique: true, sparse: true` index allows multiple `null`/`undefined` values but enforces uniqueness for any non-null value.
+
+5. **Vercel + standalone dual deployment** — The same Express app runs as a Vercel serverless function (`api/index.ts`) or a long-lived Node process (`src/server.ts`). Both share `app.ts` (the app factory) and `container.ts` (the DI wiring).
+
+6. **Single routes file** — All 15 routes are defined in one file ([routes/index.ts](backend/src/routes/index.ts)), making the entire API surface auditable at a glance.
+
+7. **Flexible payment webhook parsing** — `handlePaymentWebhook` tries 3 field names for `orderReference`, 3 for `gatewayReference`, and 2 for `paymentStatus`. This avoids breakage when payment gateway field names vary.
+
+8. **Constant-time credential comparison everywhere** — Every password, API key, and HMAC comparison uses `crypto.timingSafeEqual()`. The `validateCredentials` method also guards against login when `ADMIN_PASSWORD` is not configured.
+
+9. **Manual orders don't send WhatsApp messages** — `createFromManualInput` creates the order + payment link but does NOT notify the customer via WhatsApp. Only orders originating from WhatsApp webhooks get the payment link messaged to the customer.
+
+10. **Admin status updates only change `status`, not `paymentStatus`** — The admin panel can move an order between lifecycle states but only the payment webhook changes `paymentStatus` from `pending` to `paid`/`failed`. This maintains a clear audit trail.
+
+11. **WhatsAppService accepts optional Axios instance** — The constructor takes an optional `httpClient` parameter, allowing test code to inject a mocked Axios instance without hitting the real Facebook Graph API.
+
+12. **No WebSocket or polling** — All communication is request-response via HTTP REST. "Real-time" updates come from WhatsApp and payment gateway webhooks (inbound POST callbacks).

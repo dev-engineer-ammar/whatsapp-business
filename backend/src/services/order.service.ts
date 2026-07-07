@@ -1,5 +1,6 @@
 import { OrderModel, type OrderDocument } from "../models/order.model.js";
 import { PaymentModel } from "../models/payment.model.js";
+import { ProductModel } from "../models/product.model.js";
 import { env } from "../config/env.js";
 import { PaymentGatewayService } from "./payment.service.js";
 import { WhatsAppService } from "./whatsapp.service.js";
@@ -19,10 +20,24 @@ interface WhatsAppMessageValue {
       catalog_id?: string;
       product_items?: Array<{
         product_retailer_id?: string;
+        name?: string;
         quantity?: number;
       }>;
     };
   }>;
+}
+
+interface ParsedOrderItem {
+  catalogProductId?: string;
+  name?: string;
+  quantity: number;
+}
+
+interface PricedOrderSummary {
+  productName: string;
+  catalogProductId?: string;
+  quantity: number;
+  totalAmount: number;
 }
 
 export interface ManualOrderInput {
@@ -170,22 +185,21 @@ export class OrderService {
     }
 
     const customerName = value.contacts?.[0]?.profile?.name ?? "WhatsApp Customer";
-    const productItem = firstMessage.order?.product_items?.[0];
-    const quantity = productItem?.quantity ?? 1;
-    const productName =
+    const fallbackProductName =
       firstMessage.interactive?.button_reply?.title ??
       firstMessage.text?.body ??
       "Catalog Product";
+    const pricedOrder = await this.buildPricedOrderSummary(firstMessage, fallbackProductName);
 
     const order = await this.createOrder({
       orderReference: this.buildOrderReference(),
       customerName,
       whatsappNumber: firstMessage.from,
       sourceMessageId: firstMessage.id,
-      productName,
-      catalogProductId: productItem?.product_retailer_id ?? firstMessage.order?.catalog_id,
-      quantity,
-      totalAmount: env.payment.defaultAmount * quantity,
+      productName: pricedOrder.productName,
+      catalogProductId: pricedOrder.catalogProductId,
+      quantity: pricedOrder.quantity,
+      totalAmount: pricedOrder.totalAmount,
       currency: env.payment.defaultCurrency,
     });
 
@@ -288,12 +302,203 @@ export class OrderService {
       }>;
     };
 
-    return (
+    const cloudApiChanges =
       safeBody.entry
         ?.flatMap((entry) => entry.changes ?? [])
         .map((change) => change.value)
-        .filter((value): value is WhatsAppMessageValue => Boolean(value)) ?? []
+        .filter((value): value is WhatsAppMessageValue => Boolean(value)) ?? [];
+
+    if (cloudApiChanges.length) {
+      return cloudApiChanges;
+    }
+
+    const watiMessageValue = this.extractWatiMessageValue(body);
+    return watiMessageValue ? [watiMessageValue] : [];
+  }
+
+  private extractWatiMessageValue(body: unknown): WhatsAppMessageValue | null {
+    if (!body || typeof body !== "object") {
+      return null;
+    }
+
+    const payload = body as Record<string, unknown>;
+    const nestedPayload = this.getRecord(payload.payload) ?? this.getRecord(payload.data) ?? payload;
+    const whatsappNumber = this.getFirstString(
+      nestedPayload.waId,
+      nestedPayload.whatsappNumber,
+      nestedPayload.phone,
+      nestedPayload.from,
+      nestedPayload.sender,
+      this.getRecord(nestedPayload.contact)?.waId,
+      this.getRecord(nestedPayload.contact)?.phone
     );
+
+    if (!whatsappNumber) {
+      return null;
+    }
+
+    const textBody = this.getFirstString(
+      nestedPayload.text,
+      nestedPayload.message,
+      nestedPayload.body,
+      this.getRecord(nestedPayload.text)?.body,
+      this.getRecord(nestedPayload.message)?.text
+    );
+    const orderRecord = this.getRecord(nestedPayload.order);
+    const orderItems = this.getArray(
+      orderRecord?.product_items,
+      orderRecord?.items,
+      nestedPayload.product_items,
+      nestedPayload.productItems,
+      nestedPayload.orderItems,
+      nestedPayload.items
+    );
+
+    return {
+      contacts: [
+        {
+          profile: {
+            name:
+              this.getFirstString(
+                nestedPayload.senderName,
+                nestedPayload.sender_name,
+                this.getRecord(nestedPayload.contact)?.name
+              ) ?? "WhatsApp Customer",
+          },
+          wa_id: whatsappNumber,
+        },
+      ],
+      messages: [
+        {
+          id: this.getFirstString(nestedPayload.id, nestedPayload.messageId, nestedPayload.message_id),
+          from: whatsappNumber,
+          type: this.getFirstString(nestedPayload.type, nestedPayload.eventType),
+          text: textBody ? { body: textBody } : undefined,
+          order: orderItems.length
+            ? {
+                catalog_id: this.getFirstString(orderRecord?.catalog_id, orderRecord?.catalogId),
+                product_items: orderItems
+                  .map((item) => this.getRecord(item))
+                  .filter((item): item is Record<string, unknown> => Boolean(item))
+                  .map((item) => ({
+                    product_retailer_id: this.getFirstString(
+                      item.product_retailer_id,
+                      item.productRetailerId,
+                      item.catalogProductId,
+                      item.productId,
+                      item.sku,
+                      item.id
+                    ),
+                    name: this.getFirstString(item.name, item.title, item.productName),
+                    quantity: Number(this.getFirstString(item.quantity, item.qty) ?? 1),
+                  })),
+              }
+            : undefined,
+        },
+      ],
+    };
+  }
+
+  private async buildPricedOrderSummary(
+    message: NonNullable<WhatsAppMessageValue["messages"]>[number],
+    fallbackProductName: string
+  ): Promise<PricedOrderSummary> {
+    const parsedItems = this.parseOrderItems(message);
+
+    if (!parsedItems.length) {
+      const product = await ProductModel.findOne({
+        isActive: true,
+        $or: [{ catalogProductId: fallbackProductName }, { name: fallbackProductName }],
+      })
+        .collation({ locale: "en", strength: 2 })
+        .exec();
+
+      return {
+        productName: product?.name ?? fallbackProductName,
+        catalogProductId: product?.catalogProductId ?? undefined,
+        quantity: 1,
+        totalAmount: product?.price ?? env.payment.defaultAmount,
+      };
+    }
+
+    const catalogProductIds = parsedItems
+      .map((item) => item.catalogProductId)
+      .filter((catalogProductId): catalogProductId is string => Boolean(catalogProductId));
+    const products = catalogProductIds.length
+      ? await ProductModel.find({
+          catalogProductId: { $in: catalogProductIds },
+          isActive: true,
+        }).exec()
+      : [];
+    const productsByCatalogId = new Map(
+      products
+        .filter((product) => Boolean(product.catalogProductId))
+        .map((product) => [product.catalogProductId, product])
+    );
+
+    let totalAmount = 0;
+    let totalQuantity = 0;
+    const names: string[] = [];
+    const matchedCatalogProductIds: string[] = [];
+
+    for (const item of parsedItems) {
+      const quantity = Math.max(Number(item.quantity) || 1, 1);
+      const product = item.catalogProductId ? productsByCatalogId.get(item.catalogProductId) : undefined;
+      totalQuantity += quantity;
+      totalAmount += (product?.price ?? env.payment.defaultAmount) * quantity;
+      names.push(product?.name ?? item.name ?? item.catalogProductId ?? "Catalog Product");
+
+      if (product?.catalogProductId ?? item.catalogProductId) {
+        matchedCatalogProductIds.push(String(product?.catalogProductId ?? item.catalogProductId));
+      }
+    }
+
+    return {
+      productName: names.join(", "),
+      catalogProductId: matchedCatalogProductIds.join(", ") || undefined,
+      quantity: totalQuantity,
+      totalAmount,
+    };
+  }
+
+  private parseOrderItems(message: NonNullable<WhatsAppMessageValue["messages"]>[number]): ParsedOrderItem[] {
+    const productItems = message.order?.product_items ?? [];
+
+    return productItems.map((item) => ({
+      catalogProductId: item.product_retailer_id,
+      name: item.name,
+      quantity: item.quantity ?? 1,
+    }));
+  }
+
+  private getRecord(value: unknown): Record<string, unknown> | undefined {
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : undefined;
+  }
+
+  private getArray(...values: unknown[]): unknown[] {
+    for (const value of values) {
+      if (Array.isArray(value)) {
+        return value;
+      }
+    }
+
+    return [];
+  }
+
+  private getFirstString(...values: unknown[]): string | undefined {
+    for (const value of values) {
+      if (typeof value === "string" && value.trim()) {
+        return value.trim();
+      }
+
+      if (typeof value === "number" && Number.isFinite(value)) {
+        return String(value);
+      }
+    }
+
+    return undefined;
   }
 
   private buildOrderReference(): string {

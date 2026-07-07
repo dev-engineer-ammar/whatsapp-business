@@ -28,9 +28,11 @@ export const env = {
     uri: getEnv("MONGODB_URI", "mongodb://127.0.0.1:27017/whatsapp-commerce"),
   },
   whatsapp: {
+    provider: process.env.WHATSAPP_PROVIDER ?? "wati",
     apiVersion: process.env.WHATSAPP_API_VERSION ?? "v25.0",
-    token: getEnv("WHATSAPP_TOKEN"),
-    phoneNumberId: getEnv("WHATSAPP_PHONE_NUMBER_ID", process.env.PHONE_NUMBER_ID),
+    token: getEnv("WATI_ACCESS_TOKEN", process.env.WHATSAPP_TOKEN),
+    phoneNumberId: process.env.WHATSAPP_PHONE_NUMBER_ID ?? process.env.PHONE_NUMBER_ID,
+    watiBaseUrl: getEnv("WATI_BASE_URL", "https://live-mt-server.wati.io/10198605"),
     verifyToken: getEnv("WHATSAPP_VERIFY_TOKEN", "my_super_secret_verify_token_2026"),
   },
   payment: {
