@@ -6,6 +6,15 @@ export class WebhookController {
   constructor(private readonly orderService: OrderService) {}
 
   verifyWhatsAppWebhook = (req: Request, res: Response): void => {
+    if (env.whatsapp.provider === "wati") {
+      res.status(200).json({
+        success: true,
+        provider: "wati",
+        message: "WATI webhook endpoint is ready.",
+      });
+      return;
+    }
+
     const mode = req.query["hub.mode"];
     const token = req.query["hub.verify_token"];
     const challenge = req.query["hub.challenge"];
